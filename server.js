@@ -16,14 +16,64 @@ const pool = new Pool({
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
-// Test database connection
+// ==================== AUTO CREATE TABLES ====================
+async function initializeDatabase() {
+  try {
+    // Criar tabela user_data se não existir
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS loads (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        exercise VARCHAR(255) NOT NULL,
+        sets INTEGER NOT NULL,
+        reps INTEGER NOT NULL,
+        weight DECIMAL(6,2) NOT NULL,
+        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_data (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        data JSONB NOT NULL DEFAULT '{}',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Criar índices se não existirem
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_loads_user_id ON loads(user_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_data_user_id ON user_data(user_id)`);
+    
+    console.log('✅ Database tables initialized');
+  } catch (error) {
+    console.error('❌ Database initialization error:', error.message);
+  }
+}
+
+// Test database connection and initialize
 pool.query('SELECT NOW()', (err, res) => {
   if (err) {
     console.error('❌ Database connection error:', err);
   } else {
     console.log('✅ Database connected:', res.rows[0].now);
+    initializeDatabase();
   }
 });
 
@@ -47,11 +97,13 @@ const authMiddleware = async (req, res, next) => {
 // ==================== ROOT ENDPOINT ====================
 app.get('/', (req, res) => {
   res.json({
-    message: '🏋️ FitLife Pro API - Simple Edition',
-    version: '2.0.0',
+    message: '🏋️ FitLife Pro API - v2.1 com Sync',
+    version: '2.1.0',
     endpoints: {
       auth: '/api/auth',
-      loads: '/api/loads'
+      loads: '/api/loads',
+      data: '/api/data',
+      stats: '/api/stats'
     }
   });
 });
@@ -63,7 +115,6 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
-    // Validate input
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Nome, email e senha são obrigatórios' });
     }
@@ -72,17 +123,14 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Senha deve ter no mínimo 6 caracteres' });
     }
 
-    // Check if user exists
     const userExists = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
     
     if (userExists.rows.length > 0) {
       return res.status(400).json({ error: 'Email já cadastrado' });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Insert user
     const result = await pool.query(
       'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id, name, email',
       [name, email, hashedPassword]
@@ -90,17 +138,18 @@ app.post('/api/auth/register', async (req, res) => {
 
     const user = result.rows[0];
 
-    // Generate token
+    // Criar registro vazio em user_data
+    await pool.query(
+      'INSERT INTO user_data (user_id, data) VALUES ($1, $2)',
+      [user.id, JSON.stringify({})]
+    );
+
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
 
     res.status(201).json({
       message: 'Usuário criado com sucesso',
       token,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email
-      }
+      user: { id: user.id, name: user.name, email: user.email }
     });
   } catch (error) {
     console.error('Register error:', error);
@@ -113,12 +162,10 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    // Validate input
     if (!email || !password) {
       return res.status(400).json({ error: 'Email e senha são obrigatórios' });
     }
 
-    // Find user
     const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
 
     if (result.rows.length === 0) {
@@ -126,25 +173,18 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const user = result.rows[0];
-
-    // Check password
     const validPassword = await bcrypt.compare(password, user.password);
 
     if (!validPassword) {
       return res.status(401).json({ error: 'Email ou senha incorretos' });
     }
 
-    // Generate token
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '30d' });
 
     res.json({
       message: 'Login realizado com sucesso',
       token,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email
-      }
+      user: { id: user.id, name: user.name, email: user.email }
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -171,18 +211,75 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   }
 });
 
+// ==================== DATA SYNC ENDPOINTS ====================
+
+// Sincronizar dados (salvar)
+app.post('/api/data/sync', authMiddleware, async (req, res) => {
+  try {
+    const { data } = req.body;
+
+    if (!data || typeof data !== 'object') {
+      return res.status(400).json({ error: 'Dados inválidos' });
+    }
+
+    data.lastSyncedAt = new Date().toISOString();
+
+    const result = await pool.query(`
+      INSERT INTO user_data (user_id, data)
+      VALUES ($1, $2)
+      ON CONFLICT (user_id)
+      DO UPDATE SET data = $2, updated_at = CURRENT_TIMESTAMP
+      RETURNING id, updated_at
+    `, [req.userId, JSON.stringify(data)]);
+
+    console.log(`✅ Dados sincronizados para user ${req.userId}`);
+
+    res.json({
+      success: true,
+      message: 'Dados sincronizados com sucesso',
+      syncedAt: result.rows[0].updated_at
+    });
+  } catch (error) {
+    console.error('Sync error:', error);
+    res.status(500).json({ error: 'Erro ao sincronizar dados' });
+  }
+});
+
+// Carregar dados
+app.get('/api/data', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT data, updated_at FROM user_data WHERE user_id = $1',
+      [req.userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({
+        data: {},
+        lastSyncedAt: null,
+        message: 'Nenhum dado encontrado'
+      });
+    }
+
+    res.json({
+      data: result.rows[0].data,
+      lastSyncedAt: result.rows[0].updated_at
+    });
+  } catch (error) {
+    console.error('Load data error:', error);
+    res.status(500).json({ error: 'Erro ao carregar dados' });
+  }
+});
+
 // ==================== LOADS ENDPOINTS ====================
 
-// Get loads
 app.get('/api/loads', authMiddleware, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 50;
-    
     const result = await pool.query(
       'SELECT * FROM loads WHERE user_id = $1 ORDER BY date DESC LIMIT $2',
       [req.userId, limit]
     );
-
     res.json(result.rows);
   } catch (error) {
     console.error('Get loads error:', error);
@@ -190,19 +287,17 @@ app.get('/api/loads', authMiddleware, async (req, res) => {
   }
 });
 
-// Create load
 app.post('/api/loads', authMiddleware, async (req, res) => {
   try {
-    const { exercise, sets, reps, weight, date } = req.body;
+    const { exercise, sets, reps, weight, date, notes } = req.body;
 
-    // Validate input
     if (!exercise || !sets || !reps || weight === undefined) {
       return res.status(400).json({ error: 'Exercício, séries, reps e carga são obrigatórios' });
     }
 
     const result = await pool.query(
-      'INSERT INTO loads (user_id, exercise, sets, reps, weight, date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [req.userId, exercise, sets, reps, weight, date || new Date()]
+      'INSERT INTO loads (user_id, exercise, sets, reps, weight, date, notes) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [req.userId, exercise, sets, reps, weight, date || new Date(), notes || null]
     );
 
     res.status(201).json({
@@ -215,11 +310,9 @@ app.post('/api/loads', authMiddleware, async (req, res) => {
   }
 });
 
-// Delete load
 app.delete('/api/loads/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
-
     const result = await pool.query(
       'DELETE FROM loads WHERE id = $1 AND user_id = $2 RETURNING *',
       [id, req.userId]
@@ -238,28 +331,23 @@ app.delete('/api/loads/:id', authMiddleware, async (req, res) => {
 
 // ==================== STATS ENDPOINT ====================
 
-// Get dashboard stats
 app.get('/api/stats/dashboard', authMiddleware, async (req, res) => {
   try {
-    // Total workouts (distinct dates)
     const workoutsResult = await pool.query(
       'SELECT COUNT(DISTINCT DATE(date)) as count FROM loads WHERE user_id = $1',
       [req.userId]
     );
 
-    // Total exercises (distinct exercise names)
     const exercisesResult = await pool.query(
       'SELECT COUNT(DISTINCT exercise) as count FROM loads WHERE user_id = $1',
       [req.userId]
     );
 
-    // Total volume (sum of sets * reps * weight)
     const volumeResult = await pool.query(
       'SELECT COALESCE(SUM(sets * reps * weight), 0) as total FROM loads WHERE user_id = $1',
       [req.userId]
     );
 
-    // Recent workouts (last 7 days)
     const recentResult = await pool.query(
       'SELECT COUNT(DISTINCT DATE(date)) as count FROM loads WHERE user_id = $1 AND date >= NOW() - INTERVAL \'7 days\'',
       [req.userId]
@@ -275,6 +363,11 @@ app.get('/api/stats/dashboard', authMiddleware, async (req, res) => {
     console.error('Get stats error:', error);
     res.status(500).json({ error: 'Erro ao buscar estatísticas' });
   }
+});
+
+// ==================== HEALTH CHECK ====================
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 // ==================== START SERVER ====================
