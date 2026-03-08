@@ -370,6 +370,138 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ==================== WATCH PAIRING ENDPOINTS ====================
+
+// Armazenamento temporário dos códigos de pareamento (em produção usar Redis)
+const pairCodes = new Map(); // code -> { userId, token, expiresAt, confirmed }
+
+// 1. Watch solicita código de pareamento (sem autenticação)
+app.post('/api/auth/pair/request', async (req, res) => {
+  try {
+    // Gerar código de 6 dígitos
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = Date.now() + 5 * 60 * 1000; // expira em 5 minutos
+
+    pairCodes.set(code, {
+      userId: null,
+      token: null,
+      expiresAt,
+      confirmed: false
+    });
+
+    // Limpar códigos expirados
+    for (const [k, v] of pairCodes.entries()) {
+      if (Date.now() > v.expiresAt) pairCodes.delete(k);
+    }
+
+    console.log(`⌚ Pair code requested: ${code}`);
+
+    res.json({
+      code,
+      expiresAt,
+      message: 'Escaneie o QR Code com o app FitLife Pro'
+    });
+  } catch (error) {
+    console.error('Pair request error:', error);
+    res.status(500).json({ error: 'Erro ao gerar código' });
+  }
+});
+
+// 2. Phone confirma o pareamento (requer JWT do phone)
+app.post('/api/auth/pair/confirm', authMiddleware, async (req, res) => {
+  try {
+    const { code } = req.body;
+
+    if (!code) {
+      return res.status(400).json({ error: 'Código obrigatório' });
+    }
+
+    const pairData = pairCodes.get(code);
+
+    if (!pairData) {
+      return res.status(404).json({ error: 'Código inválido ou expirado' });
+    }
+
+    if (Date.now() > pairData.expiresAt) {
+      pairCodes.delete(code);
+      return res.status(400).json({ error: 'Código expirado' });
+    }
+
+    if (pairData.confirmed) {
+      return res.status(400).json({ error: 'Código já utilizado' });
+    }
+
+    // Buscar dados do usuário
+    const result = await pool.query(
+      'SELECT id, name, email FROM users WHERE id = $1',
+      [req.userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    const user = result.rows[0];
+
+    // Gerar token especial para o Watch (30 dias)
+    const watchToken = jwt.sign({ userId: user.id, device: 'watch' }, JWT_SECRET, { expiresIn: '30d' });
+
+    // Marcar como confirmado
+    pairCodes.set(code, {
+      ...pairData,
+      userId: user.id,
+      token: watchToken,
+      user: { id: user.id, name: user.name, email: user.email },
+      confirmed: true
+    });
+
+    console.log(`✅ Watch paired for user: ${user.email}`);
+
+    res.json({
+      message: 'Watch pareado com sucesso!',
+      user: { id: user.id, name: user.name, email: user.email }
+    });
+  } catch (error) {
+    console.error('Pair confirm error:', error);
+    res.status(500).json({ error: 'Erro ao confirmar pareamento' });
+  }
+});
+
+// 3. Watch verifica se foi confirmado (polling)
+app.get('/api/auth/pair/status/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const pairData = pairCodes.get(code);
+
+    if (!pairData) {
+      return res.status(404).json({ status: 'expired', error: 'Código inválido ou expirado' });
+    }
+
+    if (Date.now() > pairData.expiresAt) {
+      pairCodes.delete(code);
+      return res.status(400).json({ status: 'expired', error: 'Código expirado' });
+    }
+
+    if (!pairData.confirmed) {
+      const remaining = Math.floor((pairData.expiresAt - Date.now()) / 1000);
+      return res.json({ status: 'pending', remainingSeconds: remaining });
+    }
+
+    // Confirmado! Retornar token e apagar código
+    const response = {
+      status: 'confirmed',
+      token: pairData.token,
+      user: pairData.user
+    };
+    pairCodes.delete(code); // usar só uma vez
+
+    res.json(response);
+  } catch (error) {
+    console.error('Pair status error:', error);
+    res.status(500).json({ error: 'Erro ao verificar status' });
+  }
+});
+
 // ==================== START SERVER ====================
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
